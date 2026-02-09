@@ -46,6 +46,7 @@ def send_color(lighttype,r, g, b,brightness):
     color_data = bytearray([lighttype,r, g, b,brightness])
     while True:
         try:
+            #print(f"Sending color data: {list(color_data)}")
             trinket.writeto(TRINKET_ADDRESS, color_data)
             break
         except OSError as e:
@@ -227,7 +228,7 @@ async def send_temp():
                 timestamp_str = data['created_at']
                 #print(timestamp_str)
                 sse = time.mktime(gss.GetTimeTuple(timestamp_str)) # type: ignore
-                current_timestamp = gss.GetTimeStamp((time.localtime(sse+(offset*60))))
+                current_timestamp = gss.GetTimeStamp((time.localtime(sse+(offset*60))))# type: ignore
                 
                 #print(f"Current Time: {current_timestamp} ET")
                 if reply.status_code != 200:
@@ -436,8 +437,8 @@ async def main():
         print(f"Exception occurred: {e}")
         send_color(59,255,0,0,255)
         await send_status_notification(f"Error in main:{e}")
-        time.sleep(5)
-        machine.reset()
+        #time.sleep(5)
+        #machine.reset()
 # Run the asyncio event loop
 try:
     print("Inizializing...")
