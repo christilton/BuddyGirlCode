@@ -1,6 +1,8 @@
 import urequests as requests
 import time
 from gc import collect as gc
+from main import connectWifi
+
 
 def GetTimeTuple(timestamp):
     year = int(timestamp[0:4])
@@ -15,17 +17,22 @@ def GetTimeTuple(timestamp):
 def GetTime():
     try:
         gc()
-        data = requests.get("http://worldtimeapi.org/api/timezone/America/New_York")
-        if data.status_code == 200:
-            if data.json()['dst'] == True:
-                time = data.json()['unixtime'] + data.json()['raw_offset'] +3600
-                data.close()
+        unixdata = requests.get('https://timeapi.io/api/v1/time/current/unix')
+        dstdata = requests.get('https://timeapi.io/api/v1/timezone/zone?timeZone=America%2FNew_York')
+        #print(unixdata.status_code)
+        #Sprint(dstdata.status_code)
+        if unixdata.status_code == 200:
+            if dstdata.json()['dst_active'] == True:
+                time = unixdata.json()['unix_timestamp'] -18000 + 3600
+                unixdata.close()
+                dstdata.close()
             else:
-                time = data.json()['unixtime'] + data.json()['raw_offset']
-                data.close()
+                time = unixdata.json()['unix_timestamp'] - 18000
+                unixdata.close()
+                dstdata.close()
             return time
         else:
-            print(f"Error fetching time: {data.status_code}")
+            print(f"Error fetching time: {unixdata.status_code}")
             return None
     except Exception as e:
         print(f"Error fetching time: {e}")
@@ -34,11 +41,13 @@ def GetTime():
 def GetDay():
     try:
         gc()
-        data = requests.get("http://worldtimeapi.org/api/timezone/America/New_York")
+        data = requests.get('https://timeapi.io/api/v1/time/current/unix')
         if data.status_code == 200:
-            day = data.json()['day_of_year']
+            unix_timestamp = data.json()['unix_timestamp']
             data.close()
-            return day
+            time_tuple = time.localtime(unix_timestamp)
+            day_of_year = time_tuple[7]  # tm_yday is at index 7
+            return day_of_year
         else:
             print(f"Error fetching day of the year: {data.status_code}")
             return None
@@ -69,7 +78,7 @@ def GetSunriseSunset():
     """Fetches sunrise and sunset for the correct Eastern Time date."""
     date = GetEasternDate()
     if date is None:
-        return "Error fetching date"
+        return "Error fetching date in Get Sunrise/Sunset"
     
     lat, lon = 42.385408, -71.113114
     url = f"https://api.sunrisesunset.io/json?lat={lat}&lng={lon}&time_format=24&timezone=EST&date={date}"
@@ -86,7 +95,7 @@ def GetSunriseSunset():
 
             sunrise = f"{date}T{results['sunrise']}Z"
             sunset = f"{date}T{results['sunset']}Z"
-            offset = results["utc_offset"]
+            offset = -13400
 
             return offset, sunrise, sunset
         else:
@@ -97,6 +106,7 @@ def GetSunriseSunset():
         return "Error fetching sunrise/sunset times"
 
 if __name__ == "__main__":
+    print(GetTime())
     print(GetSunriseSunset())
     print(GetDay())
     print(GetTimeTuple("2022-01-01T00:00:00"))

@@ -10,6 +10,7 @@ from secrets import ADAFRUIT_AIO_KEY, ADAFRUIT_AIO_USERNAME, ssid, password
 from machine import I2C, Pin, WDT
 from sen0546 import SEN0546 
 
+
 # Global variable for setpoint
 setpoint = 0
 deadband = .25
@@ -345,7 +346,7 @@ async def check_reboot(upday):
                 reset_trinket()
                 machine.reset()
                 
-            await asyncio.sleep(900)
+            await asyncio.sleep(600)
 
 async def check_connection():
     global wlan, connected
@@ -434,7 +435,8 @@ async def main():
         ) # type: ignore
     except Exception as e:
         relay.off()
-        print(f"Exception occurred: {e}")
+        print(f"Exception occurred in line: {e}")
+        sys.print_exception(e)
         send_color(59,255,0,0,255)
         await send_status_notification(f"Error in main:{e}")
         #time.sleep(5)
@@ -468,16 +470,24 @@ try:
     print('Getting Sunrise and Sunset Times...')
     send_color(57,255,255,255,5)
     if connected:
-        offset,sunrise,sunset = gss.GetSunriseSunset()
-        upday = gss.GetDay()
-        uptime2 = gss.GetTime()
-        uptime2_timestamp = gss.GetTimeStamp(time.localtime(uptime2))
-        asyncio.run(send_status_notification(f"Uptime Date: {uptime2_timestamp}, Upday: {upday}, Sunrise = {sunrise}, Sunset = {sunset}"))
-        if compare_timestamps(uptime2_timestamp,sunrise,0):
-            sunHasRisen = True
-        if compare_timestamps(uptime2_timestamp,sunset,0):
-            sunHasSet = True
-        print(f"Risen: {sunHasRisen}, Set: {sunHasSet}")
+        result = gss.GetSunriseSunset()
+        # Validate result is a tuple/list with three items (offset, sunrise, sunset)
+        if result and isinstance(result, (tuple, list)) and len(result) == 3:
+            offset, sunrise, sunset = result
+            upday = gss.GetDay()
+            uptime2 = gss.GetTime()
+            uptime2_timestamp = gss.GetTimeStamp(time.localtime(uptime2))
+            asyncio.run(send_status_notification(f"Uptime Date: {uptime2_timestamp}, Upday: {upday}, Sunrise = {sunrise}, Sunset = {sunset}"))
+            if compare_timestamps(uptime2_timestamp, sunrise, 0):
+                sunHasRisen = True
+            if compare_timestamps(uptime2_timestamp, sunset, 0):
+                sunHasSet = True
+            print(f"Risen: {sunHasRisen}, Set: {sunHasSet}")
+            print(f"Risen: {sunHasRisen}, Set: {sunHasSet}")
+        else:
+            print(f"Error getting sunrise/sunset: {result}")
+            asyncio.run(send_status_notification("Error fetching sunrise/sunset times at startup"))
+            upday = 0
     else: 
         upday = 0
     send_color(57,0,255,0,5)
@@ -488,11 +498,17 @@ try:
     asyncio.run(main())
 except Exception as e:
     print(f"System Error: {e}")
+    buf = io.StringIO()
+    sys.print_exception(e, buf)
+    traceback_text = buf.getvalue()
+    print(traceback_text)
     time.sleep(1)
     send_color(57,255,1,1,5)
     asyncio.run(send_status_notification(f"System Stopped by Exception: {e}"))
 except KeyboardInterrupt:
     print("System Stopped")
+    if wlan is not None:
+        wlan.disconnect()
     asyncio.run(send_status_notification("System Stopped by Keyboard Interrupt"))
 finally:
     relay.off()
