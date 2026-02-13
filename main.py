@@ -17,7 +17,12 @@ deadband = .25
 sunHasRisen = False
 sunHasSet = False
 connected = False
+hasnetwork = False
 current_timestamp = 0
+offset = 0
+sunrise = None
+sunset = None
+has_sun_times = False
 # Initialize relay pin
 relay = Pin(4, Pin.OUT)
 relay.off()
@@ -43,17 +48,18 @@ def reset_i2c():
     print("I2C Reset")
 
 # Function to send RGB color to the Trinket
-def send_color(lighttype,r, g, b,brightness):
+def send_color(lighttype,r, g, b,brightness, max_retries=5, retry_delay=1):
     color_data = bytearray([lighttype,r, g, b,brightness])
-    while True:
+    for _ in range(max_retries):
         try:
             #print(f"Sending color data: {list(color_data)}")
             trinket.writeto(TRINKET_ADDRESS, color_data)
-            break
+            return True
         except OSError as e:
             print(f"Error sending color: {e}")
-            time.sleep(5)
-            continue
+            time.sleep(retry_delay)
+    print("send_color failed after max retries")
+    return False
 
 def reset_trinket():
     resetpin.low()
@@ -95,44 +101,43 @@ async def send_setpoint_periodically():
 async def manage_setpoint():
     global setpoint
     global current_timestamp
-    while True:
-        url = f'https://io.adafruit.com/api/v2/{ADAFRUIT_AIO_USERNAME}/feeds/day-setpoint-gecko/data/last'
+    global sunHasRisen, sunHasSet
+
+    def fetch_last_feed_value(feed_key, default_value):
+        url = f'https://io.adafruit.com/api/v2/{ADAFRUIT_AIO_USERNAME}/feeds/{feed_key}/data/last'
         headers = {
-        'X-AIO-Key': ADAFRUIT_AIO_KEY,
-        'Content-Type': 'application/json'
+            'X-AIO-Key': ADAFRUIT_AIO_KEY,
+            'Content-Type': 'application/json'
         }
-        gc()
-        if wlan and wlan.isconnected():
-            response = requests.get(url, headers=headers)
-            if response.status_code == 200:
-                data = response.json()
-                #print(data)
-                daytime_setpoint = float(data['value'])
+        response = None
+        try:
+            if wlan and wlan.isconnected():
+                gc()
+                response = requests.get(url, headers=headers)
+                if response.status_code == 200:
+                    data = response.json()
+                    return float(data['value'])
+        except Exception as e:
+            print(f"Failed to fetch {feed_key}: {e}")
+        finally:
+            if response is not None:
                 response.close()
-            else:
-                daytime_setpoint = 69.0 #HARDCODE HERE
-        else:
-            daytime_setpoint = 69.0 #HARDCODE HERE
-        url = f'https://io.adafruit.com/api/v2/{ADAFRUIT_AIO_USERNAME}/feeds/night-setpoint-gecko/data/last'
-        headers = {
-        'X-AIO-Key': ADAFRUIT_AIO_KEY,
-        'Content-Type': 'application/json'
-        }
-        gc()
-        if wlan and wlan.isconnected():
-            response = requests.get(url, headers=headers)
-            if response.status_code == 200:
-                data = response.json()
-                nighttime_setpoint = float(data['value'])
-            else:
-                nighttime_setpoint = 64.0 #HARDCODE HERE
-        else:
-            nighttime_setpoint = 64.0
-        response.close()
+        return default_value
+
+    while True:
+        daytime_setpoint = fetch_last_feed_value('day-setpoint-gecko', 69.0)
+        nighttime_setpoint = fetch_last_feed_value('night-setpoint-gecko', 64.0)
         
-        #HANDLE TIME HERE
-        if wlan and wlan.isconnected():
-            new_setpoint = nighttime_setpoint if compare_timestamps(current_timestamp, sunset,1800) or not compare_timestamps(current_timestamp, sunrise,3600) else daytime_setpoint
+        # Keep setpoint day/night logic aligned with light-control logic.
+        if wlan and wlan.isconnected() and has_sun_times:
+            # Update sun state from timestamp when available, then use the same
+            # state machine as control_neopixels so lights/setpoint cannot diverge.
+            if compare_timestamps(current_timestamp, sunrise, 0):
+                sunHasRisen = True
+            if compare_timestamps(current_timestamp, sunset, 0):
+                sunHasSet = True
+            is_daytime = sunHasRisen and not sunHasSet
+            new_setpoint = daytime_setpoint if is_daytime else nighttime_setpoint
         else:
             new_setpoint = 67.0
         
@@ -147,18 +152,19 @@ async def read_sensor(sht):
     lamp_status = 0
     max_retries = 5
     while True:
-        
         retries = 0
-        if retries < max_retries:
-            while retries < max_retries:
-                try:
-                    temperature = sht.temp()
-                    humidity = sht.humidity()
-                    break  # Successful read, exit retry loop
-                except OSError as e:
-                    retries += 1
-                    await asyncio.sleep(0.5)
-        else:
+        temperature = None
+        humidity = None
+        while retries < max_retries:
+            try:
+                temperature = sht.temp()
+                humidity = sht.humidity()
+                break  # Successful read, exit retry loop
+            except OSError as e:
+                retries += 1
+                await asyncio.sleep(0.5)
+
+        if retries >= max_retries or temperature is None:
             print("Max retries reached, skipping this cycle.")
             await send_status_notification("Temperature Sensor Error. Resetting...")
             reset_i2c()
@@ -204,71 +210,86 @@ async def read_sensor(sht):
         await asyncio.sleep(1)  # Read sensor values every second
 
 async def send_temp():
-    if wlan and wlan.isconnected():
-        FEED_KEY = 'temperature-gecko'
-        url = f'https://io.adafruit.com/api/v2/{ADAFRUIT_AIO_USERNAME}/feeds/{FEED_KEY}/data'
-        global current_timestamp
-        
-        while True:
-            
-            if sht is not None:
-                temperature = sht.temp()
-            #print(temperature)
-            data = {'value': temperature}
-            headers = {
-                'X-AIO-Key': ADAFRUIT_AIO_KEY,
-                'Content-Type': 'application/json'
-            }
-            
-            try:
-                # Send data to Adafruit IO
-                gc()
-                reply = requests.post(url, headers=headers, json=data)
-                #print(reply.text)
-                data = reply.json()
-                timestamp_str = data['created_at']
-                #print(timestamp_str)
-                sse = time.mktime(gss.GetTimeTuple(timestamp_str)) # type: ignore
-                current_timestamp = gss.GetTimeStamp((time.localtime(sse+(offset*60))))# type: ignore
-                
-                #print(f"Current Time: {current_timestamp} ET")
-                if reply.status_code != 200:
-                    print(reply.status_code)
-                    print(reply.text)
+    FEED_KEY = 'temperature-gecko'
+    url = f'https://io.adafruit.com/api/v2/{ADAFRUIT_AIO_USERNAME}/feeds/{FEED_KEY}/data'
+    global current_timestamp
+
+    while True:
+        if not (wlan and wlan.isconnected()):
+            await asyncio.sleep(10)
+            continue
+
+        if sht is None:
+            await asyncio.sleep(10)
+            continue
+
+        temperature = sht.temp()
+        data = {'value': temperature}
+        headers = {
+            'X-AIO-Key': ADAFRUIT_AIO_KEY,
+            'Content-Type': 'application/json'
+        }
+
+        reply = None
+        try:
+            # Send data to Adafruit IO
+            gc()
+            reply = requests.post(url, headers=headers, json=data)
+            data = reply.json()
+            timestamp_str = data['created_at']
+            sse = time.mktime(gss.GetTimeTuple(timestamp_str)) # type: ignore
+            current_timestamp = gss.GetTimeStamp((time.localtime(sse+(offset*60))))# type: ignore
+
+            if reply.status_code != 200:
+                print(reply.status_code)
+                print(reply.text)
+        except Exception as e:
+            print("Failed to send data (T):", e)
+        finally:
+            if reply is not None:
                 reply.close()  # Close the response to free up resources
-            except Exception as e:
-                print("Failed to send data (T):", e)
-            
-            await asyncio.sleep(10)  # Send data every 10 seconds
+
+        await asyncio.sleep(10)  # Send data every 10 seconds
 
 async def send_humidity():
-    if wlan and wlan.isconnected():
-        FEED_KEY = 'humidity-gecko'
-        url = f'https://io.adafruit.com/api/v2/{ADAFRUIT_AIO_USERNAME}/feeds/{FEED_KEY}/data'
-        
-        while True:
-            if sht is not None:
-                if sht.humidity() is not None:
-                    humidity = sht.humidity()
-            
-            data = {'value': humidity}
-            headers = {
-                'X-AIO-Key': ADAFRUIT_AIO_KEY,
-                'Content-Type': 'application/json'
-            }
-            
-            try:
-                # Send data to Adafruit IO
-                gc()
-                reply = requests.post(url, headers=headers, json=data)
-                if reply.status_code != 200:
-                    print(reply.status_code)
-                    print(reply.text)
+    FEED_KEY = 'humidity-gecko'
+    url = f'https://io.adafruit.com/api/v2/{ADAFRUIT_AIO_USERNAME}/feeds/{FEED_KEY}/data'
+
+    while True:
+        if not (wlan and wlan.isconnected()):
+            await asyncio.sleep(10)
+            continue
+
+        if sht is None:
+            await asyncio.sleep(10)
+            continue
+
+        humidity = sht.humidity()
+        if humidity is None:
+            await asyncio.sleep(10)
+            continue
+
+        data = {'value': humidity}
+        headers = {
+            'X-AIO-Key': ADAFRUIT_AIO_KEY,
+            'Content-Type': 'application/json'
+        }
+
+        reply = None
+        try:
+            # Send data to Adafruit IO
+            gc()
+            reply = requests.post(url, headers=headers, json=data)
+            if reply.status_code != 200:
+                print(reply.status_code)
+                print(reply.text)
+        except Exception as e:
+            print("Failed to send data: (H)", e)
+        finally:
+            if reply is not None:
                 reply.close()  # Close the response to free up resources
-            except Exception as e:
-                print("Failed to send data: (H)", e)
-            
-            await asyncio.sleep(10)  # Send data every 10 seconds
+
+        await asyncio.sleep(10)  # Send data every 10 seconds
         
 async def control_neopixels():
     global current_timestamp, sunHasRisen, sunHasSet
@@ -277,6 +298,13 @@ async def control_neopixels():
     lights_on = None  # Track light status to avoid redundant notifications
 
     while True:
+        if not has_sun_times:
+            if lights_on != False:
+                await send_lights_notification("Nighttime, Lights OFF")
+                lights_on = False
+            send_color(1, 0, 0, 0, 0)
+            await asyncio.sleep(5)
+            continue
         
         if compare_timestamps (current_timestamp, sunrise, 0):
             sunHasRisen = True
@@ -328,42 +356,44 @@ async def send_lights_notification(message):
             print(f"Failed to send error notification: {e}")
 
 async def check_reboot(upday):
-    if wlan and wlan.isconnected():
-        while True:
-            
-            current_day = gss.GetDay()
-            print(f'upday = {upday}, current_day = {current_day}')
-           # await send_status_notification(f'Checking Reboot: upday = {upday}, current_day = {current_day}')
-            
-            if current_day is None:
-                print("Error: Unable to fetch current day")
-                await send_status_notification("System unable to verify date, skipping reboot check.")
-                continue
-
-            if current_day != upday:
-                await send_status_notification("System Resetting")
-                relay.off()
-                reset_trinket()
-                machine.reset()
-                
+    while True:
+        if not (wlan and wlan.isconnected()):
             await asyncio.sleep(600)
+            continue
+
+        current_day = gss.GetDay()
+        print(f'upday = {upday}, current_day = {current_day}')
+       # await send_status_notification(f'Checking Reboot: upday = {upday}, current_day = {current_day}')
+
+        if current_day is None:
+            print("Error: Unable to fetch current day")
+            await send_status_notification("System unable to verify date, skipping reboot check.")
+            await asyncio.sleep(600)
+            continue
+
+        if current_day != upday:
+            await send_status_notification("System Resetting")
+            relay.off()
+            reset_trinket()
+            machine.reset()
+
+        await asyncio.sleep(600)
 
 async def check_connection():
-    global wlan, connected
+    global wlan, connected, hasnetwork
     while True:
         if not wlan or not wlan.isconnected():
             print("Wi-Fi disconnected! Attempting to reconnect...")
+            # Fail-safe: don't leave heater latched ON while networking is unstable.
+            relay.off()
             send_color(59, 255, 255, 255, 50)  # White = Reconnecting
-            
-            wlan = connectWifi()  # ✅ This ensures wlan is updated globally
-            
-            if wlan:
-                connected = True
-            else:
-                connected = False
+            wlan = connectWifi()
+            hasnetwork = wlan is not None
+            connected = hasnetwork
         else:
+            hasnetwork = True
             connected = True
-        
+
         await asyncio.sleep(60)  # Check every minute
 
 async def periodic_status_report():
@@ -374,47 +404,61 @@ async def periodic_status_report():
          await asyncio.sleep(3600)  # Every hour
         
 def connectWifi():
-    global wlan, connected
+    global wlan, connected, hasnetwork
     send_color(59, 255, 255, 255, 5)
     print('Attempting to Connect to WiFi...')
+
     if wlan is None:
-        new_wlan = network.WLAN(network.STA_IF)
-        new_wlan.active(True)
-    
-    elif wlan.isconnected():
+        wlan = network.WLAN(network.STA_IF)
+    new_wlan = wlan
+    new_wlan.active(True)
+
+    # Prevent re-connecting an already connected interface.
+    if new_wlan.isconnected():
         print(f'Already connected to {ssid}.')
-        send_color(59, 0, 255, 0, 5)  # Green = already connected
+        send_color(59, 0, 255, 0, 5)
         connected = True
-        return wlan
+        hasnetwork = True
+        return new_wlan
 
-    new_wlan.connect(ssid, password)
-    timeout = 0
     backoff = 1  # Start with 1 second backoff
+    max_attempts = 3
 
-    while not new_wlan.isconnected():
+    for _ in range(max_attempts):
         new_wlan.connect(ssid, password)
-        for _ in range(10):  # 1 second increments
+
+        # Wait up to 5 seconds for this attempt.
+        for _ in range(5):
             if new_wlan.isconnected():
                 wlan = new_wlan
                 connected = True
+                hasnetwork = True
                 send_color(59, 0, 255, 0, 25)
                 print(f'Connected to {ssid}.')
                 return wlan
             time.sleep(1)
-        timeout += 1
-        backoff = min(backoff * 2, 60)  # Double backoff up to 60 seconds
+
+        backoff = min(backoff * 2, 5)  # Keep reconnect blocking window short
         print(f"Retrying WiFi in {backoff} seconds...")
         time.sleep(backoff)
+
     send_color(59, 255, 0, 0, 5)
     connected = False
+    hasnetwork = False
     return None
 
 def compare_timestamps(currenttime,eventtime,newoffset):
-    ct = time.mktime(gss.GetTimeTuple(currenttime))-newoffset # type: ignore
-    et = time.mktime(gss.GetTimeTuple(eventtime))-newoffset # type: ignore
-    if int(ct) >= int(et):
-        return True
-    else:
+    if currenttime is None or eventtime is None:
+        return False
+    try:
+        ct = time.mktime(gss.GetTimeTuple(currenttime)) # type: ignore
+        et = time.mktime(gss.GetTimeTuple(eventtime))-newoffset # type: ignore
+        if int(ct) >= int(et):
+            return True
+        else:
+            return False
+    except Exception as e:
+        print(f"compare_timestamps error: {e}")
         return False
   
 async def main():
@@ -447,6 +491,7 @@ try:
     reset_trinket()
     time.sleep(5)
     wlan = connectWifi()
+    hasnetwork = wlan is not None
     print(wlan)
     asyncio.run(send_status_notification(f"Connected to Wifi"))
     print('Connecting to Temperature Sensor...')
@@ -469,14 +514,24 @@ try:
             continue
     print('Getting Sunrise and Sunset Times...')
     send_color(57,255,255,255,5)
-    if connected:
-        result = gss.GetSunriseSunset()
+    if hasnetwork:
+        if not hasattr(gss, "GetSunriseSunset"):
+            print("getSunriseSunset module missing GetSunriseSunset()")
+            print("Available attributes:", dir(gss))
+            asyncio.run(send_status_notification("gss missing GetSunriseSunset; check uploaded module"))
+            result = None
+        else:
+            result = gss.GetSunriseSunset()
         # Validate result is a tuple/list with three items (offset, sunrise, sunset)
         if result and isinstance(result, (tuple, list)) and len(result) == 3:
             offset, sunrise, sunset = result
-            upday = gss.GetDay()
-            uptime2 = gss.GetTime()
-            uptime2_timestamp = gss.GetTimeStamp(time.localtime(uptime2))
+            has_sun_times = True
+            upday = gss.GetDay() if hasattr(gss, "GetDay") else 0
+            uptime2 = gss.GetTime() if hasattr(gss, "GetTime") else None
+            if uptime2 is not None and hasattr(gss, "GetTimeStamp"):
+                uptime2_timestamp = gss.GetTimeStamp(time.localtime(uptime2))
+            else:
+                uptime2_timestamp = "unknown"
             asyncio.run(send_status_notification(f"Uptime Date: {uptime2_timestamp}, Upday: {upday}, Sunrise = {sunrise}, Sunset = {sunset}"))
             if compare_timestamps(uptime2_timestamp, sunrise, 0):
                 sunHasRisen = True
@@ -488,8 +543,10 @@ try:
             print(f"Error getting sunrise/sunset: {result}")
             asyncio.run(send_status_notification("Error fetching sunrise/sunset times at startup"))
             upday = 0
+            has_sun_times = False
     else: 
         upday = 0
+        has_sun_times = False
     send_color(57,0,255,0,5)
     asyncio.run(send_status_notification("Initialization complete, System ON"))
     time.sleep(2)
@@ -497,6 +554,7 @@ try:
     #MAIN LOOP
     asyncio.run(main())
 except Exception as e:
+    relay.off()
     print(f"System Error: {e}")
     buf = io.StringIO()
     sys.print_exception(e, buf)
@@ -513,3 +571,6 @@ except KeyboardInterrupt:
 finally:
     relay.off()
     send_color(1,0,0,0,0)
+
+
+
